@@ -22,12 +22,14 @@
 
 #include <stdint.h>
 #include <thread>
+#include <regex.h>
 
 #include "Module.h"
 #include "tracing/Logging.h"
 #include "utils.h"
 #include "AbstractPlugin.h"
 #include "SystemServicesHelper.h"
+#include "platformcaps/platformcaps.h"
 #if defined(USE_IARMBUS) || defined(USE_IARM_BUS)
 #include "libIARM.h"
 #include "libIBus.h"
@@ -55,6 +57,7 @@
 #define EVT_ON_SYSTEM_CLOCK_SET           "onSystemClockSet"
 #define EVT_ONFWPENDINGREBOOT             "onFirmwarePendingReboot" /* Auto Reboot notifier */
 #define EVT_ONREBOOTREQUEST               "onRebootRequest"
+#define EVT_ONFIRMWAREDOWNLOADPROGRES     "onFirmwareDownloadProgress"
 
 namespace WPEFramework {
     namespace Plugin {
@@ -110,9 +113,12 @@ namespace WPEFramework {
                 static cTimer m_operatingModeTimer;
                 static int m_remainingDuration;
                 Utils::ThreadRAII m_getFirmwareInfoThread;
+                Utils::ThreadRAII m_fwDownloadProgressThread;
                 PluginHost::IShell* m_shellService { nullptr };
+                regex_t m_regexUnallowedChars;
 
                 int m_FwUpdateState_LatestEvent;
+                bool fwDownloadProgress100sent;
 
                 static void startModeTimer(int duration);
                 static void stopModeTimer();
@@ -145,6 +151,7 @@ namespace WPEFramework {
                 void onPwrMgrReboot(string requestedApp, string rebootReason);
                 void onSystemModeChanged(string mode);
                 void onFirmwareUpdateStateChange(int state);
+                void onFirmwareDownloadStateChange(int state);
                 void onClockSet();
                 void onTemperatureThresholdChanged(string thresholdType,
                         bool exceed, float temperature);
@@ -186,6 +193,10 @@ namespace WPEFramework {
                 uint32_t getFirmwareUpdateInfo(const JsonObject& parameters, JsonObject& response);
                 void reportFirmwareUpdateInfoReceived(string firmwareUpdateVersion,
                         int httpStatus, bool success, string firmwareVersion, string responseString);
+
+                static void firmwareDownloadProgress(void);
+                void reportFirmwareDownloadProgress(int percents);
+
                 uint32_t setDeepSleepTimer(const JsonObject& parameters, JsonObject& response);
                 uint32_t setPreferredStandbyMode(const JsonObject& parameters, JsonObject& response);
                 uint32_t getPreferredStandbyMode(const JsonObject& parameters, JsonObject& response);
@@ -236,6 +247,10 @@ namespace WPEFramework {
                 uint32_t setFirmwareAutoReboot(const JsonObject& parameters, JsonObject& response);
                 uint32_t getStoreDemoLink(const JsonObject& parameters, JsonObject& response);
                 uint32_t deletePersistentPath(const JsonObject& parameters, JsonObject& response);
+#ifdef ENABLE_SET_WAKEUP_SRC_CONFIG
+                uint32_t setWakeupSrcConfiguration(const JsonObject& parameters, JsonObject& response);
+#endif //ENABLE_SET_WAKEUP_SRC_CONFIG
+                uint32_t getPlatformConfiguration(const JsonObject& parameters, PlatformCaps& response);
         }; /* end of system service class */
     } /* end of plugin */
 } /* end of wpeframework */

@@ -81,10 +81,15 @@ using namespace std;
 
 #define OPTOUT_TELEMETRY_STATUS "/opt/tmtryoptout"
 
+#define REGEX_UNALLOWABLE_INPUT "[^[:alnum:]_-]{1}"
+
 #define STORE_DEMO_FILE "/opt/persistent/store-mode-video/videoFile.mp4"
 #define STORE_DEMO_LINK "http://127.0.0.1:50050/store-mode-video/videoFile.mp4"
 
 #define RFC_CALLERID           "SystemServices"
+
+#define CURL_PROGRESS "/opt/curl_progress"
+#define MAX_FIRMWARE_DOWNLOAD_PROGRESS_ATTEMPTS 30
 
 /**
  * @struct firmwareUpdate
@@ -296,6 +301,9 @@ namespace WPEFramework {
             }
 
             SystemServices::m_FwUpdateState_LatestEvent=FirmwareUpdateStateUninitialized;
+            fwDownloadProgress100sent = false;
+
+            regcomp (&m_regexUnallowedChars, REGEX_UNALLOWABLE_INPUT, REG_EXTENDED);
 
             /**
              * @brief Invoking Plugin API register to WPEFRAMEWORK.
@@ -380,6 +388,9 @@ namespace WPEFramework {
             registerMethod("setNetworkStandbyMode", &SystemServices::setNetworkStandbyMode, this);
             registerMethod("getNetworkStandbyMode", &SystemServices::getNetworkStandbyMode, this);
             registerMethod("getPowerStateIsManagedByDevice", &SystemServices::getPowerStateIsManagedByDevice, this);
+#ifdef ENABLE_SET_WAKEUP_SRC_CONFIG
+            registerMethod("setWakeupSrcConfiguration", &SystemServices::setWakeupSrcConfiguration, this);
+#endif //ENABLE_SET_WAKEUP_SRC_CONFIG
 
             // version 2 APIs
             registerMethod(_T("getTimeZones"), &SystemServices::getTimeZones, this, {2});
@@ -401,11 +412,14 @@ namespace WPEFramework {
             registerMethod("getStoreDemoLink", &SystemServices::getStoreDemoLink, this, {2});
 #endif
             registerMethod("deletePersistentPath", &SystemServices::deletePersistentPath, this, {2});
+            GetHandler(2)->Register<JsonObject, PlatformCaps>("getPlatformConfiguration",
+                &SystemServices::getPlatformConfiguration, this);
         }
 
 
         SystemServices::~SystemServices()
-        {       
+        {
+            regfree (&m_regexUnallowedChars);
         }
 
         const string SystemServices::Initialize(PluginHost::IShell* service)
@@ -774,6 +788,16 @@ namespace WPEFramework {
             if (parameters.HasLabel("params")) {
                 queryParams = parameters["params"].String();
                 removeCharsFromString(queryParams, "[\"]");
+
+                regmatch_t  m_regmatchUnallowedChars[1];
+                if (REG_NOERROR == regexec(&m_regexUnallowedChars, queryParams.c_str(), 1, m_regmatchUnallowedChars, 0))
+                {
+                    response["message"] = "Input has unallowable characters";
+                    LOGERR("Input has unallowable characters: '%s'", queryParams.c_str());
+
+                    returnResponse(false);
+                }
+
             }
 
             // there is no /tmp/.make from /lib/rdk/getDeviceDetails.sh, but it can be taken from /etc/device.properties
@@ -1285,6 +1309,102 @@ namespace WPEFramework {
             }
         } //end of event onFirmwareInfoRecived
 
+
+        /***
+         * @brief : Firmware download progress worker.
+         */
+        void SystemServices::firmwareDownloadProgress(void)
+        {
+            if (!_instance) {
+                LOGERR("_instance is NULL.\n");
+                return;
+            }
+
+            int lastSize = 0;
+            int maxAttempts = MAX_FIRMWARE_DOWNLOAD_PROGRESS_ATTEMPTS;
+
+            for (int n = 0; n < 100; n++) {
+                int fsize = 0;
+
+                char buf[1024];
+                FILE *f = fopen(CURL_PROGRESS, "r");
+
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    fsize = ftell(f);
+                } else if (lastSize) {
+                    // Looks like the file just dissappeared
+                    break;
+                }
+
+                if (fsize == lastSize) {
+                    if (f)
+                        fclose(f);
+
+                    sleep(1);
+
+                    if (maxAttempts-- >= 0) {
+                        continue;
+                    } else {
+                        LOGERR("Max attempts to get firmware download progress");
+                        break;
+                    }
+                } else {
+                    maxAttempts = MAX_FIRMWARE_DOWNLOAD_PROGRESS_ATTEMPTS;
+                }
+
+                lastSize = fsize;
+
+                fseek(f, -128, SEEK_CUR);
+
+                size_t rd = fread(buf, 1, sizeof(buf) - 1, f);
+                buf[rd] = 0;
+
+                char *cret = strrchr(buf, '\r');
+
+                if (cret && strlen(++cret) >= 3) {
+                    while (' ' == *cret) 
+                        cret++;
+
+                    char *end;
+                    int perc = strtol(cret, &end, 10);
+                    if (end && ' ' != *end) {
+                        LOGERR("Failed to parse percents of firmware download progress:'%s'", end);
+                    }
+
+                    if (_instance)
+                        _instance->reportFirmwareDownloadProgress(perc);
+
+                    if (100 == perc) {
+                        break;
+                    }
+
+                } else {
+                    LOGERR("Failed to parse percents of firmware download progress didn't find the '\\r'");
+                }
+
+                fclose(f);
+                sleep(1);
+            }
+        }
+
+        /***
+         * @brief  : Event sender for firmware download progress.
+         * @param1[in] : download percents
+         */
+        void SystemServices::reportFirmwareDownloadProgress(int percents)
+        {
+            if (fwDownloadProgress100sent)
+                return;
+
+            JsonObject params;
+            params["downloadPercent"] = percents;
+            sendNotify(EVT_ONFIRMWAREDOWNLOADPROGRES, params);
+
+            if (100 == percents)
+                fwDownloadProgress100sent = true;
+        }
+
         /***
          * @brief  : To check Firmware Update Info
          * @param1[in] : {"params":{}}
@@ -1754,7 +1874,7 @@ namespace WPEFramework {
         {
             bool retStatus = false;
             int m_downloadPercent = -1;
-            if (Utils::fileExists("/opt/curl_progress")) {
+            if (Utils::fileExists(CURL_PROGRESS)) {
                 /* TODO: replace with new implementation. */
                 FILE* fp = popen(CAT_DWNLDPROGRESSFILE_AND_GET_INFO, "r");
                 if (NULL != fp) {
@@ -1841,26 +1961,32 @@ namespace WPEFramework {
                             }
                         }
                     }
-                    found = line.find("DnldVersn|");
-                    if (std::string::npos != found) {
-                        while ((pos = line.find(delimiter)) != std::string::npos) {
-                            token = line.substr(0, pos);
-                            line.erase(0, pos + delimiter.length());
+                    // return DnldVersn based on IARM Firmware Update State
+                    // If Firmware Update State is Downloading or above then 
+                    // return DnldVersion from FWDNLDSTATUS_FILE_NAME else return empty
+                    if(m_FwUpdateState_LatestEvent >=2)
+                    {
+                        found = line.find("DnldVersn|");
+                        if (std::string::npos != found) {
+                            while ((pos = line.find(delimiter)) != std::string::npos) {
+                                token = line.substr(0, pos);
+                                line.erase(0, pos + delimiter.length());
+                            }
+                            line = std::regex_replace(line, std::regex("^ +| +$"), "$1");
+                            if (line.length() > 1) {
+                                downloadedFWVersion = line.c_str();
+                            }
                         }
-                        line = std::regex_replace(line, std::regex("^ +| +$"), "$1");
-                        if (line.length() > 1) {
-                            downloadedFWVersion = line.c_str();
-                        }
-                    }
-                    found = line.find("DnldURL|");
-                    if (std::string::npos != found) {
-                        while ((pos = line.find(delimiter)) != std::string::npos) {
-                            token = line.substr(0, pos);
-                            line.erase(0, pos + delimiter.length());
-                        }
-                        line = std::regex_replace(line, std::regex("^ +| +$"), "$1");
-                        if (line.length() > 1) {
-                            downloadedFWLocation = line.c_str();
+                        found = line.find("DnldURL|");
+                        if (std::string::npos != found) {
+                            while ((pos = line.find(delimiter)) != std::string::npos) {
+                                token = line.substr(0, pos);
+                                line.erase(0, pos + delimiter.length());
+                            }
+                            line = std::regex_replace(line, std::regex("^ +| +$"), "$1");
+                            if (line.length() > 1) {
+                                downloadedFWLocation = line.c_str();
+                            }
                         }
                     }
                 }
@@ -1907,6 +2033,25 @@ namespace WPEFramework {
             params["firmwareUpdateStateChange"] = (int)firmwareUpdateState;
             LOGINFO("New firmwareUpdateState = %d\n", (int)firmwareUpdateState);
             sendNotify(EVT_ONFIRMWAREUPDATESTATECHANGED, params);
+        }
+
+        /***
+         * @brief : starts thread to send events about firmware download progress
+         *
+         * @param1[in]  : newstate
+         */
+        void SystemServices::onFirmwareDownloadStateChange(int newState)
+        {
+            if (m_fwDownloadProgressThread.get().joinable()) {
+                m_fwDownloadProgressThread.get().join();
+            }
+
+            if (IARM_BUS_SYSMGR_IMAGE_FWDNLD_DOWNLOAD_INPROGRESS == newState) {
+                fwDownloadProgress100sent = false;
+                m_fwDownloadProgressThread = Utils::ThreadRAII(std::thread(firmwareDownloadProgress));
+            } else if (IARM_BUS_SYSMGR_IMAGE_FWDNLD_DOWNLOAD_COMPLETE == newState) {
+                reportFirmwareDownloadProgress(100);
+            }
         }
 
         /***
@@ -2025,7 +2170,6 @@ namespace WPEFramework {
 		bool resp = false;
 		if (parameters.HasLabel("timeZone")) {
 			std::string dir = dirnameOf(TZ_FILE);
-			ofstream outfile;
 			std::string timeZone = "";
 			try {
 				timeZone = parameters["timeZone"].String();
@@ -2039,11 +2183,14 @@ namespace WPEFramework {
 						//Do nothing//
 					}
 
-					outfile.open(TZ_FILE,ios::out);
-					if (outfile) {
-						outfile << timeZone;
-						outfile.close();
-						LOGWARN("Set TimeZone: %s\n", timeZone.c_str());
+					FILE *f = fopen(TZ_FILE, "w");
+					if (f) {
+						if (timeZone.size() != fwrite(timeZone.c_str(), 1, timeZone.size(), f))
+							LOGERR("Failed to write %s", TZ_FILE);
+
+						fflush(f);
+						fsync(fileno(f));
+						fclose(f);
 						resp = true;
 					} else {
 						LOGERR("Unable to open %s file.\n", TZ_FILE);
@@ -3227,6 +3374,66 @@ namespace WPEFramework {
             returnResponse(retVal);
         }
 
+#ifdef ENABLE_SET_WAKEUP_SRC_CONFIG
+	/***
+         * @brief : To set the wakeup source configuration.
+         * @param1[in] : {"params":{ "wakeupSrc": <int>, "config": <int>}
+         * @param2[out] : {"result":{"success":<bool>}}
+         * @return     : Core::<StatusCode>
+         */
+        uint32_t SystemServices::setWakeupSrcConfiguration(const JsonObject& parameters,
+                JsonObject& response)
+        {
+            bool status = false;
+            string src, value;
+            WakeupSrcType_t srcType;
+            bool config;
+            int paramErr = 0;
+            IARM_Bus_PWRMgr_SetWakeupSrcConfig_Param_t param;
+            if (parameters.HasLabel("wakeupSrc") && parameters.HasLabel("config")) {
+                src = parameters["wakeupSrc"].String();
+                srcType = (WakeupSrcType_t)atoi(src.c_str());
+                value = parameters["config"].String();
+                config = (bool)atoi(value.c_str());
+
+                switch(srcType){
+                    case WAKEUPSRC_VOICE:
+                    case WAKEUPSRC_PRESENCE_DETECTION:
+                    case WAKEUPSRC_BLUETOOTH:
+                    case WAKEUPSRC_WIFI:
+                    case WAKEUPSRC_IR:
+                    case WAKEUPSRC_POWER_KEY:
+                    case WAKEUPSRC_TIMER:
+                    case WAKEUPSRC_CEC:
+                    case WAKEUPSRC_LAN:
+                        param.srcType = srcType;
+                        param.config = config;
+                        break;
+                    default:
+                        LOGERR("setWakeupSrcConfiguration invalid parameter\n");
+                        status = false;
+                        paramErr = 1;
+                }
+
+                if(paramErr == 0) {
+
+                    IARM_Result_t res = IARM_Bus_Call(IARM_BUS_PWRMGR_NAME,
+                                           IARM_BUS_PWRMGR_API_SetWakeupSrcConfig, (void *)&param,
+                                           sizeof(param));
+
+                    if (IARM_RESULT_SUCCESS == res) {
+                        status = true;
+                    } else {
+                        status = false;
+                    }
+                }
+            } else {
+                LOGERR("setWakeupSrcConfiguration Missing Key Values\n");
+                populateResponseWithError(SysSrv_MissingKeyValues, response);
+            }
+            returnResponse(status);
+        }
+#endif //ENABLE_SET_WAKEUP_SRC_CONFIG
 
         /***
          * @brief : To handle the event of Power State change.
@@ -3345,6 +3552,16 @@ namespace WPEFramework {
                         LOGWARN("IARMEvt: IARM_BUS_SYSMGR_SYSSTATE_FIRMWARE_UPDATE_STATE = '%d'\n", state);
                         if (SystemServices::_instance) {
                             SystemServices::_instance->onFirmwareUpdateStateChange(state);
+                        } else {
+                            LOGERR("SystemServices::_instance is NULL.\n");
+                        }
+                    } break;
+
+                case IARM_BUS_SYSMGR_SYSSTATE_FIRMWARE_DWNLD:
+                    {
+                        LOGWARN("IARMEvt: IARM_BUS_SYSMGR_SYSSTATE_FIRMWARE_DWNLD = '%d'\n", state);
+                        if (SystemServices::_instance) {
+                            SystemServices::_instance->onFirmwareDownloadStateChange(state);
                         } else {
                             LOGERR("SystemServices::_instance is NULL.\n");
                         }
@@ -3724,6 +3941,18 @@ namespace WPEFramework {
           }
 
           returnResponse(result);
+        }
+
+        uint32_t SystemServices::getPlatformConfiguration(const JsonObject &parameters, PlatformCaps &response)
+        {
+          LOGINFOMETHOD();
+
+          const string query = parameters.HasLabel("query") ? parameters["query"].String() : "";
+
+          response.Load(query);
+
+          LOGTRACEMETHODFIN();
+          return Core::ERROR_NONE;
         }
     } /* namespace Plugin */
 } /* namespace WPEFramework */
